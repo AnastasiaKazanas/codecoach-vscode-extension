@@ -16,21 +16,12 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
-    "commands": [
-      {
-        "command": "codecoach.helloWorld",
-        "title": "Hello World"
-      },
-      {
-        "command": "codecoach.explainSelection",
-        "title": "CodeCoach: Explain Selection"
-      },
-      {
-        "command": "codecoach.setApiKey",
-        "title": "CodeCoach: Set OpenAI API Key"
-      }
-    ]
-  },
+  "commands": [
+    { "command": "codecoach.explainSelection", "title": "CodeCoach: Explain Selection" },
+    { "command": "codecoach.setApiKey", "title": "CodeCoach: Set Gemini API Key" },
+    { "command": "codecoach.listGeminiModels", "title": "CodeCoach: List Gemini Models" }
+  ]
+},
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
