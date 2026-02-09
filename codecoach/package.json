@@ -33,6 +33,7 @@
         {
           "id": "codecoach.chatView",
           "name": "Chat",
+          "type": "webview",
           "icon": "media/icon.svg"
         }
       ]
