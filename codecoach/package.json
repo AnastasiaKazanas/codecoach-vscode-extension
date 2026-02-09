@@ -1,27 +1,43 @@
 {
   "name": "codecoach",
   "displayName": "CodeCoach",
-  "description": "Ai-powered programming explanations and hints inside VS code",
+  "description": "AI-powered programming explanations and hints inside VS Code",
   "version": "0.0.1",
   "engines": {
     "vscode": "^1.108.0"
   },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onCommand:codecoach.setApiKey",
-    "onCommand:codecoach.explainSelection",
-    "onCommand:codecoach.helloWorld"
-  ],
+  "categories": ["Other"],
   "main": "./dist/extension.js",
+  "activationEvents": [
+    "onStartupFinished",
+    "onView:codecoach.chatView",
+    "onCommand:codecoach.openChat",
+    "onCommand:codecoach.setApiKey"
+  ],
   "contributes": {
-  "commands": [
-    { "command": "codecoach.explainSelection", "title": "CodeCoach: Explain Selection" },
-    { "command": "codecoach.setApiKey", "title": "CodeCoach: Set Gemini API Key" },
-    { "command": "codecoach.listGeminiModels", "title": "CodeCoach: List Gemini Models" }
-  ]
-},
+    "commands": [
+      { "command": "codecoach.openChat", "title": "CodeCoach: Open Chat" },
+      { "command": "codecoach.setApiKey", "title": "CodeCoach: Set Gemini API Key" }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "codecoach",
+          "title": "CodeCoach",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "codecoach": [
+        {
+          "id": "codecoach.chatView",
+          "name": "Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    }
+  },
   "scripts": {
     "vscode:prepublish": "npm run package",
     "compile": "npm run check-types && npm run lint && node esbuild.js",
@@ -39,7 +55,7 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "22.x",
-    "@types/vscode": "^1.109.0",
+    "@types/vscode": "^1.108.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "esbuild": "^0.27.2",
@@ -47,8 +63,5 @@
     "npm-run-all": "^4.1.5",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.54.0"
-  },
-  "dependencies": {
-    "openai": "^6.18.0"
   }
 }

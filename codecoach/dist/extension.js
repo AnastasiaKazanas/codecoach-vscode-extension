@@ -34,125 +34,174 @@ __export(extension_exports, {
   deactivate: () => deactivate
 });
 module.exports = __toCommonJS(extension_exports);
+var vscode2 = __toESM(require("vscode"));
+
+// src/codecoachView.ts
 var vscode = __toESM(require("vscode"));
+console.log("\u2705 codecoachView.ts module loaded");
+var CodeCoachViewProvider = class {
+  constructor(context, onUserMessage) {
+    this.context = context;
+    this.onUserMessage = onUserMessage;
+  }
+  static viewType = "codecoach.chatView";
+  _view;
+  resolveWebviewView(webviewView) {
+    console.log("\u2705 resolveWebviewView called");
+    this._view = webviewView;
+    webviewView.webview.options = {
+      enableScripts: true
+    };
+    webviewView.webview.html = this.getHtml();
+    webviewView.webview.onDidReceiveMessage(async (msg) => {
+      if (msg.type !== "send") {
+        return;
+      }
+      try {
+        const editor = vscode.window.activeTextEditor;
+        const contextText = editor?.document.getText() ?? "";
+        const reply = await this.onUserMessage(msg.text, contextText);
+        webviewView.webview.postMessage({
+          type: "assistant",
+          text: reply
+        });
+      } catch (err) {
+        webviewView.webview.postMessage({
+          type: "assistant",
+          text: `Error: ${err.message ?? String(err)}`
+        });
+      }
+    });
+  }
+  reveal() {
+    this._view?.show?.(true);
+  }
+  getHtml() {
+    return (
+      /* html */
+      `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<style>
+  body {
+    font-family: sans-serif;
+    margin: 0;
+    padding: 8px;
+  }
+  #chat {
+    height: calc(100vh - 60px);
+    overflow-y: auto;
+    margin-bottom: 8px;
+  }
+  .user { font-weight: bold; }
+  .assistant { color: #444; margin-bottom: 12px; }
+</style>
+</head>
+<body>
+  <div id="chat"></div>
+  <input id="input" placeholder="Ask CodeCoach\u2026" style="width: 100%;" />
+
+<script>
+  const vscode = acquireVsCodeApi();
+  const chat = document.getElementById("chat");
+  const input = document.getElementById("input");
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && input.value.trim()) {
+      const text = input.value;
+      input.value = "";
+
+      chat.innerHTML += '<div class="user">You:</div>' + text;
+      vscode.postMessage({ type: "send", text });
+    }
+  });
+
+  window.addEventListener("message", (event) => {
+    if (event.data.type === "assistant") {
+      chat.innerHTML += '<div class="assistant"><b>CodeCoach:</b><br>' + event.data.text + '</div>';
+    }
+  });
+</script>
+</body>
+</html>
+`
+    );
+  }
+};
+
+// src/extension.ts
 var KEY_NAME = "codecoach.geminiKey";
-var MODEL_NAME_KEY = "codecoach.geminiModelName";
 function activate(context) {
-  console.log("CodeCoach activated");
+  console.log("\u2705 CodeCoach activate() ran");
   context.subscriptions.push(
-    vscode.commands.registerCommand("codecoach.setApiKey", async () => {
-      const key = await vscode.window.showInputBox({
+    vscode2.commands.registerCommand("codecoach.setApiKey", async () => {
+      const key = await vscode2.window.showInputBox({
         prompt: "Paste your Gemini API key (from Google AI Studio)",
         password: true,
         ignoreFocusOut: true
       });
-      if (!key) return;
+      if (!key) {
+        return;
+      }
+      console.log("\u2705 Registered view:", CodeCoachViewProvider.viewType);
       await context.secrets.store(KEY_NAME, key.trim());
-      vscode.window.showInformationMessage("CodeCoach: Gemini API key saved.");
+      vscode2.window.showInformationMessage("CodeCoach: Gemini API key saved.");
     })
   );
+  const onUserMessage = async (userText, contextText) => {
+    const apiKey = await context.secrets.get(KEY_NAME);
+    if (!apiKey) {
+      throw new Error('No Gemini API key set. Run "CodeCoach: Set Gemini API Key".');
+    }
+    const modelName = "models/gemini-flash-latest";
+    const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+    const MAX_CONTEXT_CHARS = 2e4;
+    const safeContext = (contextText || "").length > MAX_CONTEXT_CHARS ? (contextText || "").slice(0, MAX_CONTEXT_CHARS) + "\n\n[Context truncated]" : contextText || "";
+    const instructions = `
+You are CodeCoach, a programming tutor inside VS Code.
+
+Rules:
+- Explain concepts clearly.
+- Prefer: explanation \u2192 hint \u2192 small example.
+- Do NOT give full solutions unless explicitly asked.
+- If the user's question is ambiguous, ask ONE clarifying question.
+- End with exactly ONE short guiding question.
+`.trim();
+    const prompt = `
+${instructions}
+
+Relevant code context (from the user's editor):
+${safeContext || "(no code context available)"}
+
+User question:
+${userText}
+`.trim();
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.3 }
+      })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      const msg = data?.error?.message ?? JSON.stringify(data);
+      throw new Error(`${res.status} ${msg}`);
+    }
+    return data?.candidates?.[0]?.content?.parts?.map((p) => p?.text).join("") ?? "No response.";
+  };
+  const provider = new CodeCoachViewProvider(context, onUserMessage);
   context.subscriptions.push(
-    vscode.commands.registerCommand("codecoach.listGeminiModels", async () => {
-      const apiKey = await context.secrets.get(KEY_NAME);
-      if (!apiKey) {
-        vscode.window.showErrorMessage("Set your Gemini API key first (CodeCoach: Set Gemini API Key).");
-        return;
-      }
-      try {
-        const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(apiKey)}`;
-        const res = await fetch(listUrl);
-        const data = await res.json();
-        if (!res.ok) {
-          const msg = data?.error?.message ?? JSON.stringify(data);
-          throw new Error(`${res.status} ${msg}`);
-        }
-        const names = (data?.models ?? []).map((m) => m?.name).filter((n) => typeof n === "string" && n.length > 0);
-        if (names.length === 0) {
-          vscode.window.showErrorMessage("No models returned for this key.");
-          return;
-        }
-        const pick = await vscode.window.showQuickPick(names, {
-          title: "Pick a Gemini model to use",
-          placeHolder: "Choose a model (we will save it for Explain Selection)"
-        });
-        if (!pick) return;
-        await context.globalState.update(MODEL_NAME_KEY, pick);
-        await vscode.env.clipboard.writeText(pick);
-        vscode.window.showInformationMessage(`Saved model: ${pick} (also copied to clipboard)`);
-      } catch (err) {
-        vscode.window.showErrorMessage(`CodeCoach error: ${err?.message ?? String(err)}`);
-        console.error("List models error:", err);
-      }
-    })
+    vscode2.window.registerWebviewViewProvider("codecoach.chatView", provider)
   );
+  console.log("\u2705 registered provider for codecoach.chatView");
   context.subscriptions.push(
-    vscode.commands.registerCommand("codecoach.explainSelection", async () => {
-      const editor = vscode.window.activeTextEditor;
-      if (!editor) {
-        vscode.window.showErrorMessage("Open a file first.");
-        return;
-      }
-      const selectedText = editor.document.getText(editor.selection).trim();
-      if (!selectedText) {
-        vscode.window.showErrorMessage("Select some code first.");
-        return;
-      }
-      const apiKey = await context.secrets.get(KEY_NAME);
-      if (!apiKey) {
-        vscode.window.showErrorMessage("Set your Gemini API key first (CodeCoach: Set Gemini API Key).");
-        return;
-      }
-      const savedModel = context.globalState.get(MODEL_NAME_KEY);
-      const modelName = savedModel ?? "models/gemini-flash-latest";
-      await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: "CodeCoach (Gemini) is thinking\u2026",
-          cancellable: false
-        },
-        async () => {
-          try {
-            const prompt = `
-You are CodeCoach, a programming tutor.
-Do NOT give full solutions unless explicitly asked.
-Explain concepts clearly.
-Give hints and small examples.
-End with one short question that checks understanding.
-
-Explain this code:
-
-${selectedText}
-            `.trim();
-            const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
-            const res = await fetch(url, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                contents: [{ role: "user", parts: [{ text: prompt }] }],
-                generationConfig: { temperature: 0.3 }
-              })
-            });
-            const data = await res.json();
-            if (!res.ok) {
-              const msg = data?.error?.message ?? JSON.stringify(data);
-              throw new Error(`${res.status} ${msg}`);
-            }
-            const explanation = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text).join("") ?? "No response.";
-            const doc = await vscode.workspace.openTextDocument({
-              content: `# CodeCoach Explanation (Gemini)
-
-**Model:** \`${modelName}\`
-
-${explanation}`,
-              language: "markdown"
-            });
-            await vscode.window.showTextDocument(doc, { preview: true });
-          } catch (err) {
-            vscode.window.showErrorMessage(`CodeCoach error: ${err?.message ?? String(err)}`);
-            console.error("Explain error:", err);
-          }
-        }
-      );
+    vscode2.commands.registerCommand("codecoach.openChat", async () => {
+      await vscode2.commands.executeCommand("workbench.view.extension.codecoach");
+      provider.reveal();
     })
   );
 }
