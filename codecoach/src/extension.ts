@@ -3,6 +3,15 @@ import { CodeCoachViewProvider } from "./codecoachView";
 
 const KEY_NAME = "codecoach.geminiKey";
 
+// -----------------------------
+// In-memory chat history (session-only)
+// -----------------------------
+type ChatMsg = { role: "user" | "model"; text: string };
+
+// Resets when the Extension Host reloads / VS Code window reloads
+const chatHistory: ChatMsg[] = [];
+const MAX_TURNS = 12; // last 12 user+model pairs (24 messages max)
+
 export function activate(context: vscode.ExtensionContext) {
   // Command: set Gemini API key
   console.log("✅ CodeCoach activate() ran");
@@ -13,7 +22,6 @@ export function activate(context: vscode.ExtensionContext) {
         password: true,
         ignoreFocusOut: true,
       });
-
 
       if (!key) {
         return;
@@ -26,12 +34,35 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // Optional: clear chat (session-only)
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codecoach.clearChat", async () => {
+      chatHistory.length = 0;
+      vscode.window.showInformationMessage("CodeCoach: chat cleared for this session.");
+    })
+  );
+
   // Function called by the sidebar when user sends a message
   const onUserMessage = async (userText: string, contextText: string): Promise<string> => {
     const apiKey = await context.secrets.get(KEY_NAME);
     if (!apiKey) {
       throw new Error('No Gemini API key set. Run "CodeCoach: Set Gemini API Key".');
     }
+
+    // Save the user's message into memory (session-only)
+    chatHistory.push({ role: "user", text: userText });
+
+    // Trim history to last MAX_TURNS pairs
+    const maxMsgs = MAX_TURNS * 2;
+    if (chatHistory.length > maxMsgs) {
+      chatHistory.splice(0, chatHistory.length - maxMsgs);
+    }
+
+    // Build transcript string (exclude current user message since it's included below)
+    const historyText = chatHistory
+      .slice(0, -1)
+      .map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.text}`)
+      .join("\n");
 
     // If your account needs a different model, swap it here
     const modelName = "models/gemini-flash-latest";
@@ -120,6 +151,9 @@ If the user asks to ignore the file:
     const prompt = `
 ${instructions}
 
+Conversation so far:
+${historyText || "(none)"}
+
 Relevant code context (from the user's editor):
 ${safeContext || "(no code context available)"}
 
@@ -143,20 +177,27 @@ ${userText}
       throw new Error(`${res.status} ${msg}`);
     }
 
-    return (
+    const reply =
       data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).join("") ??
-      "No response."
-    );
+      "No response.";
+
+    // Save model reply into memory (session-only)
+    chatHistory.push({ role: "model", text: reply });
+    if (chatHistory.length > maxMsgs) {
+      chatHistory.splice(0, chatHistory.length - maxMsgs);
+    }
+
+    return reply;
   };
 
   // Register sidebar view provider
-const provider = new CodeCoachViewProvider(context, onUserMessage);
+  const provider = new CodeCoachViewProvider(context, onUserMessage);
 
-context.subscriptions.push(
-  vscode.window.registerWebviewViewProvider("codecoach.chatView", provider)
-);
+  context.subscriptions.push(
+    vscode.window.registerWebviewViewProvider("codecoach.chatView", provider)
+  );
 
-console.log("✅ registered provider for codecoach.chatView");
+  console.log("✅ registered provider for codecoach.chatView");
 
   // Command: reveal sidebar (reliable)
   context.subscriptions.push(
