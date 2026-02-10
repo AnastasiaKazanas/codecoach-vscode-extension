@@ -3,15 +3,90 @@ import { CodeCoachViewProvider } from "./codecoachView";
 
 const KEY_NAME = "codecoach.geminiKey";
 
+// -----------------------------
+// In-memory chat history (session-only)
+// -----------------------------
 type ChatMsg = { role: "user" | "model"; text: string };
-
-// Resets when the Extension Host reloads / VS Code window reloads
 const chatHistory: ChatMsg[] = [];
 const MAX_TURNS = 12; // last 12 user+model pairs (24 messages max)
 
+// -----------------------------
+// Persistent learning profile (overall, across sessions)
+// -----------------------------
+const PROFILE_KEY = "codecoach.learningProfile.v1";
+
+type LearningProfile = {
+  updatedAtISO: string;
+  mastered: string[];      // fundamentals shown mastery in
+  developing: string[];    // fundamentals still developing
+  topics: string[];        // recurring topics covered
+  notes?: string;          // optional short notes
+};
+
+function uniq(arr: string[]) {
+  return Array.from(new Set(arr.map(s => s.trim()).filter(Boolean)));
+}
+
+function mergeProfiles(oldP: LearningProfile, newP: LearningProfile): LearningProfile {
+  // Heuristic:
+  // - mastered accumulates (if something is mastered, keep it mastered)
+  // - developing accumulates BUT remove items that are now mastered
+  // - topics accumulates
+  const mastered = uniq([...(oldP.mastered || []), ...(newP.mastered || [])]);
+  const developingRaw = uniq([...(oldP.developing || []), ...(newP.developing || [])]);
+  const developing = developingRaw.filter(x => !mastered.includes(x));
+  const topics = uniq([...(oldP.topics || []), ...(newP.topics || [])]);
+
+  return {
+    updatedAtISO: new Date().toISOString(),
+    mastered,
+    developing,
+    topics,
+    notes: newP.notes || oldP.notes,
+  };
+}
+
+async function callGeminiGenerateContent(apiKey: string, prompt: string) {
+  const modelName = "models/gemini-flash-latest";
+  const url =
+    `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent` +
+    `?key=${encodeURIComponent(apiKey)}`;
+
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3 },
+    }),
+  });
+
+  const data: any = await res.json();
+  if (!res.ok) {
+    const msg = data?.error?.message ?? JSON.stringify(data);
+    throw new Error(`${res.status} ${msg}`);
+  }
+
+  return (
+    data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).join("") ??
+    "No response."
+  );
+}
+
 export function activate(context: vscode.ExtensionContext) {
-  // Command: set Gemini API key
   console.log("✅ CodeCoach activate() ran");
+
+  // Load overall profile (persisted across sessions)
+  let learningProfile: LearningProfile =
+    context.globalState.get<LearningProfile>(PROFILE_KEY) || {
+      updatedAtISO: new Date().toISOString(),
+      mastered: [],
+      developing: [],
+      topics: [],
+      notes: "",
+    };
+
+  // Command: set Gemini API key
   context.subscriptions.push(
     vscode.commands.registerCommand("codecoach.setApiKey", async () => {
       const key = await vscode.window.showInputBox({
@@ -20,11 +95,7 @@ export function activate(context: vscode.ExtensionContext) {
         ignoreFocusOut: true,
       });
 
-      if (!key) {
-        return;
-      }
-
-      console.log("✅ Registered view:", CodeCoachViewProvider.viewType);
+      if (!key) return;
 
       await context.secrets.store(KEY_NAME, key.trim());
       vscode.window.showInformationMessage("CodeCoach: Gemini API key saved.");
@@ -39,6 +110,142 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
+  // NEW: Export learning summary (session + overall)
+  context.subscriptions.push(
+    vscode.commands.registerCommand("codecoach.exportLearningSummary", async () => {
+      const apiKey = await context.secrets.get(KEY_NAME);
+      if (!apiKey) {
+        vscode.window.showErrorMessage('No Gemini API key set. Run "CodeCoach: Set Gemini API Key".');
+        return;
+      }
+
+      if (chatHistory.length === 0) {
+        vscode.window.showWarningMessage("No chat history yet in this session.");
+        return;
+      }
+
+      // Build a transcript (use more turns for summarization than for coaching)
+      const transcript = chatHistory
+        .map(m => `${m.role === "user" ? "User" : "Coach"}: ${m.text}`)
+        .join("\n");
+
+      const overallProfileJson = JSON.stringify(learningProfile, null, 2);
+
+      // Ask Gemini for STRICT JSON so we can merge reliably
+      const summaryPrompt = `
+You are producing a learning summary and a structured learning profile.
+
+Return ONLY valid JSON matching this schema (no markdown, no extra keys):
+{
+  "session": {
+    "topicsDiscussed": string[],
+    "fundamentalsMastered": string[],
+    "fundamentalsDeveloping": string[],
+    "highlights": string[]
+  },
+  "overallUpdate": {
+    "topics": string[],
+    "mastered": string[],
+    "developing": string[],
+    "notes": string
+  }
+}
+
+Rules:
+- Be concise.
+- "fundamentalsMastered" means the student demonstrated correct understanding or execution.
+- "fundamentalsDeveloping" means confusion, errors, or incomplete understanding remains.
+- Fundamentals should be generic skills (e.g., "Big-O reasoning", "state invariants", "JS async/await", "regex basics") not project-specific tasks.
+- Avoid duplicates and keep items short.
+
+OVERALL PROFILE SO FAR:
+${overallProfileJson}
+
+SESSION TRANSCRIPT:
+${transcript}
+`.trim();
+
+      let parsed: any;
+      try {
+        const raw = await callGeminiGenerateContent(apiKey, summaryPrompt);
+        parsed = JSON.parse(raw);
+      } catch (e: any) {
+        vscode.window.showErrorMessage(
+          "Failed to export summary (model did not return valid JSON). Try again."
+        );
+        return;
+      }
+
+      const session = parsed?.session;
+      const update = parsed?.overallUpdate;
+
+      if (!session || !update) {
+        vscode.window.showErrorMessage("Failed to export summary (missing expected fields).");
+        return;
+      }
+
+      // Update + persist overall profile
+      const newProfile: LearningProfile = {
+        updatedAtISO: new Date().toISOString(),
+        mastered: uniq(update.mastered || []),
+        developing: uniq(update.developing || []),
+        topics: uniq(update.topics || []),
+        notes: (update.notes || "").toString(),
+      };
+
+      learningProfile = mergeProfiles(learningProfile, newProfile);
+      await context.globalState.update(PROFILE_KEY, learningProfile);
+
+      // Build a nice markdown report for the user
+      const md = `# CodeCoach Learning Summary
+
+## Session Summary (this chat)
+**Topics discussed**
+${(session.topicsDiscussed || []).map((x: string) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals mastered (evidence shown)**
+${(session.fundamentalsMastered || []).map((x: string) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals still developing**
+${(session.fundamentalsDeveloping || []).map((x: string) => `- ${x}`).join("\n") || "- (none)"}
+
+**Highlights**
+${(session.highlights || []).map((x: string) => `- ${x}`).join("\n") || "- (none)"}
+
+---
+
+## Overall Learning Summary (to date)
+_Last updated: ${learningProfile.updatedAtISO}_
+
+**Topics covered**
+${(learningProfile.topics || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals mastered to date**
+${(learningProfile.mastered || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals still developing**
+${(learningProfile.developing || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Notes**
+${learningProfile.notes?.trim() ? learningProfile.notes : "(none)"}
+`;
+
+      // Copy to clipboard
+      await vscode.env.clipboard.writeText(md);
+
+      // Open in a new editor tab
+      const doc = await vscode.workspace.openTextDocument({
+        content: md,
+        language: "markdown",
+      });
+      await vscode.window.showTextDocument(doc, { preview: false });
+
+      vscode.window.showInformationMessage(
+        "Learning summary exported (opened in editor + copied to clipboard)."
+      );
+    })
+  );
+
   // Function called by the sidebar when user sends a message
   const onUserMessage = async (userText: string, contextText: string): Promise<string> => {
     const apiKey = await context.secrets.get(KEY_NAME);
@@ -46,28 +253,22 @@ export function activate(context: vscode.ExtensionContext) {
       throw new Error('No Gemini API key set. Run "CodeCoach: Set Gemini API Key".');
     }
 
-    // Save the user's message into memory (session-only)
+    // Save user's message in session memory
     chatHistory.push({ role: "user", text: userText });
 
-    // Trim history to last MAX_TURNS pairs
+    // Trim chat history for the coaching loop
     const maxMsgs = MAX_TURNS * 2;
     if (chatHistory.length > maxMsgs) {
       chatHistory.splice(0, chatHistory.length - maxMsgs);
     }
 
-    // Build transcript string (exclude current user message since it's included below)
+    // Transcript (exclude current user message; it appears below)
     const historyText = chatHistory
       .slice(0, -1)
-      .map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.text}`)
+      .map(m => `${m.role === "user" ? "User" : "Coach"}: ${m.text}`)
       .join("\n");
 
-    // If your account needs a different model, swap it here
-    const modelName = "models/gemini-flash-latest";
-    const url =
-      `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent` +
-      `?key=${encodeURIComponent(apiKey)}`;
-
-    // Keep context bounded (Gemini can error if you send too much)
+    // Keep context bounded
     const MAX_CONTEXT_CHARS = 20_000;
     const safeContext =
       (contextText || "").length > MAX_CONTEXT_CHARS
@@ -158,27 +359,9 @@ User question:
 ${userText}
 `.trim();
 
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.3 },
-      }),
-    });
+    const reply = await callGeminiGenerateContent(apiKey, prompt);
 
-    const data: any = await res.json();
-
-    if (!res.ok) {
-      const msg = data?.error?.message ?? JSON.stringify(data);
-      throw new Error(`${res.status} ${msg}`);
-    }
-
-    const reply =
-      data?.candidates?.[0]?.content?.parts?.map((p: any) => p?.text).join("") ??
-      "No response.";
-
-    // Save model reply into memory (session-only)
+    // Save model reply in session memory
     chatHistory.push({ role: "model", text: reply });
     if (chatHistory.length > maxMsgs) {
       chatHistory.splice(0, chatHistory.length - maxMsgs);
@@ -189,17 +372,14 @@ ${userText}
 
   // Register sidebar view provider
   const provider = new CodeCoachViewProvider(context, onUserMessage);
-
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("codecoach.chatView", provider)
   );
-
   console.log("✅ registered provider for codecoach.chatView");
 
   // Command: reveal sidebar (reliable)
   context.subscriptions.push(
     vscode.commands.registerCommand("codecoach.openChat", async () => {
-      // This reveals the Activity Bar container with id "codecoach"
       await vscode.commands.executeCommand("workbench.view.extension.codecoach");
       provider.reveal();
     })

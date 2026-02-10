@@ -296,8 +296,50 @@ var CodeCoachViewProvider = class {
 var KEY_NAME = "codecoach.geminiKey";
 var chatHistory = [];
 var MAX_TURNS = 12;
+var PROFILE_KEY = "codecoach.learningProfile.v1";
+function uniq(arr) {
+  return Array.from(new Set(arr.map((s) => s.trim()).filter(Boolean)));
+}
+function mergeProfiles(oldP, newP) {
+  const mastered = uniq([...oldP.mastered || [], ...newP.mastered || []]);
+  const developingRaw = uniq([...oldP.developing || [], ...newP.developing || []]);
+  const developing = developingRaw.filter((x) => !mastered.includes(x));
+  const topics = uniq([...oldP.topics || [], ...newP.topics || []]);
+  return {
+    updatedAtISO: (/* @__PURE__ */ new Date()).toISOString(),
+    mastered,
+    developing,
+    topics,
+    notes: newP.notes || oldP.notes
+  };
+}
+async function callGeminiGenerateContent(apiKey, prompt) {
+  const modelName = "models/gemini-flash-latest";
+  const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { temperature: 0.3 }
+    })
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const msg = data?.error?.message ?? JSON.stringify(data);
+    throw new Error(`${res.status} ${msg}`);
+  }
+  return data?.candidates?.[0]?.content?.parts?.map((p) => p?.text).join("") ?? "No response.";
+}
 function activate(context) {
   console.log("\u2705 CodeCoach activate() ran");
+  let learningProfile = context.globalState.get(PROFILE_KEY) || {
+    updatedAtISO: (/* @__PURE__ */ new Date()).toISOString(),
+    mastered: [],
+    developing: [],
+    topics: [],
+    notes: ""
+  };
   context.subscriptions.push(
     vscode2.commands.registerCommand("codecoach.setApiKey", async () => {
       const key = await vscode2.window.showInputBox({
@@ -305,10 +347,7 @@ function activate(context) {
         password: true,
         ignoreFocusOut: true
       });
-      if (!key) {
-        return;
-      }
-      console.log("\u2705 Registered view:", CodeCoachViewProvider.viewType);
+      if (!key) return;
       await context.secrets.store(KEY_NAME, key.trim());
       vscode2.window.showInformationMessage("CodeCoach: Gemini API key saved.");
     })
@@ -317,6 +356,119 @@ function activate(context) {
     vscode2.commands.registerCommand("codecoach.clearChat", async () => {
       chatHistory.length = 0;
       vscode2.window.showInformationMessage("CodeCoach: chat cleared for this session.");
+    })
+  );
+  context.subscriptions.push(
+    vscode2.commands.registerCommand("codecoach.exportLearningSummary", async () => {
+      const apiKey = await context.secrets.get(KEY_NAME);
+      if (!apiKey) {
+        vscode2.window.showErrorMessage('No Gemini API key set. Run "CodeCoach: Set Gemini API Key".');
+        return;
+      }
+      if (chatHistory.length === 0) {
+        vscode2.window.showWarningMessage("No chat history yet in this session.");
+        return;
+      }
+      const transcript = chatHistory.map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.text}`).join("\n");
+      const overallProfileJson = JSON.stringify(learningProfile, null, 2);
+      const summaryPrompt = `
+You are producing a learning summary and a structured learning profile.
+
+Return ONLY valid JSON matching this schema (no markdown, no extra keys):
+{
+  "session": {
+    "topicsDiscussed": string[],
+    "fundamentalsMastered": string[],
+    "fundamentalsDeveloping": string[],
+    "highlights": string[]
+  },
+  "overallUpdate": {
+    "topics": string[],
+    "mastered": string[],
+    "developing": string[],
+    "notes": string
+  }
+}
+
+Rules:
+- Be concise.
+- "fundamentalsMastered" means the student demonstrated correct understanding or execution.
+- "fundamentalsDeveloping" means confusion, errors, or incomplete understanding remains.
+- Fundamentals should be generic skills (e.g., "Big-O reasoning", "state invariants", "JS async/await", "regex basics") not project-specific tasks.
+- Avoid duplicates and keep items short.
+
+OVERALL PROFILE SO FAR:
+${overallProfileJson}
+
+SESSION TRANSCRIPT:
+${transcript}
+`.trim();
+      let parsed;
+      try {
+        const raw = await callGeminiGenerateContent(apiKey, summaryPrompt);
+        parsed = JSON.parse(raw);
+      } catch (e) {
+        vscode2.window.showErrorMessage(
+          "Failed to export summary (model did not return valid JSON). Try again."
+        );
+        return;
+      }
+      const session = parsed?.session;
+      const update = parsed?.overallUpdate;
+      if (!session || !update) {
+        vscode2.window.showErrorMessage("Failed to export summary (missing expected fields).");
+        return;
+      }
+      const newProfile = {
+        updatedAtISO: (/* @__PURE__ */ new Date()).toISOString(),
+        mastered: uniq(update.mastered || []),
+        developing: uniq(update.developing || []),
+        topics: uniq(update.topics || []),
+        notes: (update.notes || "").toString()
+      };
+      learningProfile = mergeProfiles(learningProfile, newProfile);
+      await context.globalState.update(PROFILE_KEY, learningProfile);
+      const md = `# CodeCoach Learning Summary
+
+## Session Summary (this chat)
+**Topics discussed**
+${(session.topicsDiscussed || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals mastered (evidence shown)**
+${(session.fundamentalsMastered || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals still developing**
+${(session.fundamentalsDeveloping || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Highlights**
+${(session.highlights || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+---
+
+## Overall Learning Summary (to date)
+_Last updated: ${learningProfile.updatedAtISO}_
+
+**Topics covered**
+${(learningProfile.topics || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals mastered to date**
+${(learningProfile.mastered || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Fundamentals still developing**
+${(learningProfile.developing || []).map((x) => `- ${x}`).join("\n") || "- (none)"}
+
+**Notes**
+${learningProfile.notes?.trim() ? learningProfile.notes : "(none)"}
+`;
+      await vscode2.env.clipboard.writeText(md);
+      const doc = await vscode2.workspace.openTextDocument({
+        content: md,
+        language: "markdown"
+      });
+      await vscode2.window.showTextDocument(doc, { preview: false });
+      vscode2.window.showInformationMessage(
+        "Learning summary exported (opened in editor + copied to clipboard)."
+      );
     })
   );
   const onUserMessage = async (userText, contextText) => {
@@ -330,8 +482,6 @@ function activate(context) {
       chatHistory.splice(0, chatHistory.length - maxMsgs);
     }
     const historyText = chatHistory.slice(0, -1).map((m) => `${m.role === "user" ? "User" : "Coach"}: ${m.text}`).join("\n");
-    const modelName = "models/gemini-flash-latest";
-    const url = `https://generativelanguage.googleapis.com/v1beta/${modelName}:generateContent?key=${encodeURIComponent(apiKey)}`;
     const MAX_CONTEXT_CHARS = 2e4;
     const safeContext = (contextText || "").length > MAX_CONTEXT_CHARS ? (contextText || "").slice(0, MAX_CONTEXT_CHARS) + "\n\n[Context truncated]" : contextText || "";
     const instructions = `You are CodeCoach, a custom GPT whose purpose is to implement and follow the following specifications: support learning first, instead of providing solutions outright, engage students in conversation about what they are trying to achieve, explain the fundamentals required for the task, be a teaching presence and encourage thinking. Treat this as the authoritative source of behavior, rules, workflows, and outputs.
@@ -416,20 +566,7 @@ ${safeContext || "(no code context available)"}
 User question:
 ${userText}
 `.trim();
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.3 }
-      })
-    });
-    const data = await res.json();
-    if (!res.ok) {
-      const msg = data?.error?.message ?? JSON.stringify(data);
-      throw new Error(`${res.status} ${msg}`);
-    }
-    const reply = data?.candidates?.[0]?.content?.parts?.map((p) => p?.text).join("") ?? "No response.";
+    const reply = await callGeminiGenerateContent(apiKey, prompt);
     chatHistory.push({ role: "model", text: reply });
     if (chatHistory.length > maxMsgs) {
       chatHistory.splice(0, chatHistory.length - maxMsgs);

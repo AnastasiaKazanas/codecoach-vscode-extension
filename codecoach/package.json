@@ -17,7 +17,8 @@
   "contributes": {
     "commands": [
       { "command": "codecoach.openChat", "title": "CodeCoach: Open Chat" },
-      { "command": "codecoach.setApiKey", "title": "CodeCoach: Set Gemini API Key" }
+      { "command": "codecoach.setApiKey", "title": "CodeCoach: Set Gemini API Key" },
+      { "command": "codecoach.exportLearningSummary", "title": "CodeCoach: Export Learning Summary" }
     ],
     "viewsContainers": {
       "activitybar": [
