@@ -3,9 +3,6 @@ import { CodeCoachViewProvider } from "./codecoachView";
 
 const KEY_NAME = "codecoach.geminiKey";
 
-// -----------------------------
-// In-memory chat history (session-only)
-// -----------------------------
 type ChatMsg = { role: "user" | "model"; text: string };
 
 // Resets when the Extension Host reloads / VS Code window reloads
